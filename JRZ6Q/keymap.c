@@ -56,6 +56,20 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
   ),
 };
 
+// Key overrides: swap [] and {} so curly braces are the default
+const key_override_t lbrc_override = ko_make_with_layers_and_negmods(0, KC_LBRC, S(KC_LBRC), ~0, MOD_MASK_SHIFT);
+const key_override_t lbrc_shift_override = ko_make_basic(MOD_MASK_SHIFT, KC_LBRC, KC_LBRC);
+const key_override_t rbrc_override = ko_make_with_layers_and_negmods(0, KC_RBRC, S(KC_RBRC), ~0, MOD_MASK_SHIFT);
+const key_override_t rbrc_shift_override = ko_make_basic(MOD_MASK_SHIFT, KC_RBRC, KC_RBRC);
+
+const key_override_t *key_overrides[] = {
+    &lbrc_override,
+    &lbrc_shift_override,
+    &rbrc_override,
+    &rbrc_shift_override,
+    NULL
+};
+
 const char chordal_hold_layout[MATRIX_ROWS][MATRIX_COLS] PROGMEM = LAYOUT(
   'L', 'L', 'L', 'L', 'L', 'L', 'R', 'R', 'R', 'R', 'R', 'R', 
   'L', 'L', 'L', 'L', 'L', 'L', 'R', 'R', 'R', 'R', 'R', 'R', 
