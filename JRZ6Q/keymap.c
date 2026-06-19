@@ -178,6 +178,26 @@ bool rgb_matrix_indicators_user(void) {
 
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+  // Typing drops the auto-mouse layer instantly so W/E/R go back to being letters.
+  // A modifier used in a mouse gesture (shift-click, Ctrl/Shift+scroll-zoom) is always
+  // a HOLD, so held modifiers and the click keys keep the layer; anything you type
+  // drops it. layer_off() sticks until the next trackpad motion re-activates the layer.
+  if (record->event.pressed && layer_state_is(AUTOMOUSE_LAYER)) {
+    switch (keycode) {
+    case KC_MS_BTN1:
+    case KC_MS_BTN2:
+    case KC_MS_BTN3:
+      break;                              // clicks (and drag) — keep the layer
+    case QK_MOD_TAP ... QK_MOD_TAP_MAX:   // home-row mods etc. — keep (tap.count is 0
+      break;                              //   at press for both tap and hold)
+    case KC_LEFT_CTRL ... KC_RIGHT_GUI:   // plain mods (thumb GUI, pinky shift) — keep
+      break;
+    default:
+      layer_off(AUTOMOUSE_LAYER);         // anything typed — drop the click layer
+      break;
+    }
+  }
+
   switch (keycode) {
   case QK_MODS ... QK_MODS_MAX:
     // Mouse and consumer keys (volume, media) with modifiers work inconsistently across operating systems,
