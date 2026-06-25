@@ -1,0 +1,16 @@
+diff --git a/navigator_trackpad/navigator_trackpad_ptp.c b/navigator_trackpad/navigator_trackpad_ptp.c
+index 488c2b1..e681be5 100644
+--- a/navigator_trackpad/navigator_trackpad_ptp.c
++++ b/navigator_trackpad/navigator_trackpad_ptp.c
+@@ -473,6 +473,11 @@ bool navigator_trackpad_ptp_task(void) {
+         static int16_t  am_prev_id = -1;
+         static uint16_t am_prev_x  = 0;
+         static uint16_t am_prev_y  = 0;
++
++        // Keep the auto-mouse layer warm while any finger rests on the pad, even at zero
++        // motion delta (a still finger would otherwise look like "no finger" to automouse).
++        automouse_report_contact(cur_n > 0);
++
+         if (cur_n > 0) {
+             if (cur[0].id == am_prev_id) {
+                 automouse_report_motion((int16_t)cur[0].x - (int16_t)am_prev_x,
