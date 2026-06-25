@@ -1,10 +1,13 @@
 # Trackpad: keep the mouse layer alive while a finger rests (contact keep-alive) — design
 
 **Date:** 2026-06-25
-**Revision:** v2 — incorporates two-reviewer findings (firmware logic + CI/blast-radius).
-Material changes from v1: self-decaying contact signal (not a pure latch), `is_active`↔layer
-reconcile, corrected build-resolution model (modules are firmware-pinned, *not* floating
-main), and `patch`-based in-container apply with geometry/firmware guards.
+**Revision:** v3 — incorporates two-reviewer findings (firmware logic + CI/blast-radius) plus
+exact-source grounding during planning. Material changes from v1: self-decaying contact
+signal (not a pure latch); contact keep-alive **gated on `layer_state_is`** (v2's
+`automouse_deactivate` reconcile was insufficient — once `is_active` went false it stopped
+firing and drift could re-accumulate); corrected build-resolution model (modules are
+firmware-pinned, *not* floating main); `patch`-based in-container apply with geometry/firmware
+guards; resolved build target `firmware25` / `modules/zsa @ 2e0fc66`.
 **Keyboard:** ZSA Voyager (`JRZ6Q`), Oryx + custom-QMK hybrid, Navigator trackpad.
 **Host:** macOS. Build: GitHub Actions → Docker → QMK.
 **Builds on:** `2026-06-19-mouse-layer-instant-off-on-typing-design.md` and the
@@ -69,47 +72,55 @@ drops the layer instantly (existing `keymap.c` guard, untouched).
 
 ## Decision — code shape
 
-Two additive module patches. The contact signal is a **self-decaying timestamp**, not a
-pure latch, and automouse **reconciles `is_active` against the real layer state** — these
-two properties close the failure modes found in review (see Pitfalls).
+Two additive module patches. The contact signal is a **self-decaying timestamp** (not a
+pure latch), and the contact keep-alive is **gated on the real layer state**
+(`layer_state_is`), not on `state.is_active` — these two properties close the failure modes
+found in review (see Pitfalls).
 
 ### Patch A — `automouse` module (`automouse/automouse.c`, `automouse.h`)
 
 ```c
-// automouse.h — public surface
+// automouse.h — public surface (append after automouse_report_motion, automouse.h:47)
 void automouse_report_contact(bool finger_present);
 
-// automouse.c
-#define AUTOMOUSE_CONTACT_STALE_MS 120   // > trackpad poll interval; tune in plan
+// automouse.c — file-statics near the existing `state` struct (automouse.c:10-26)
+#define AUTOMOUSE_CONTACT_STALE_MS 120   // > poll(5ms)+liftoff-confirm(~15ms), << TIMEOUT(650ms)
 
 static bool     finger_present = false;
 static uint16_t last_contact   = 0;
 
+// automouse.c — append near automouse_report_motion (mirrors its is_enabled early-return)
 void automouse_report_contact(bool present) {
-    finger_present = present;            // mirror is_enabled guard if upstream uses one
+    if (!state.is_enabled) return;
+    finger_present = present;
     if (present) last_contact = timer_read();
 }
 
-// inside the existing timeout/keep-alive block (automouse.c:136-138):
-//   was:  if (state.is_active && state.held_keys > 0)
-//   now:  if (state.is_active && (state.held_keys > 0 ||
-//             (finger_present && timer_elapsed(last_contact) < AUTOMOUSE_CONTACT_STALE_MS)))
+// automouse.c:136 — the keep-alive condition. Gate the NEW contact term on the ACTUAL
+// layer being on; leave the existing held_keys term exactly as-is.
+//   was:  if (state.is_active && state.held_keys > 0) {
+//   now:  if (state.is_active &&
+//             (state.held_keys > 0 ||
+//              (layer_state_is(AUTOMOUSE_LAYER) && finger_present &&
+//               timer_elapsed(last_contact) < AUTOMOUSE_CONTACT_STALE_MS))) {
 //             state.last_activity = timer_read();
-
-// is_active ↔ layer reconcile (fixes typed-off resurrection): before the keep-alive,
-// if the layer was dropped externally (e.g. the keymap typing-guard), sync down so the
-// motion accumulators get reset and a resting finger can't re-cross threshold:
-//   if (state.is_active && !layer_state_is(AUTOMOUSE_LAYER)) automouse_deactivate();
+//         }
 ```
 
 Two load-bearing properties:
-1. **Self-decaying:** keep-alive counts contact only while `timer_elapsed(last_contact) <
+1. **Self-decaying:** the contact term counts only while `timer_elapsed(last_contact) <
    AUTOMOUSE_CONTACT_STALE_MS`. If the trackpad task stops reporting for *any* reason
-   (bus error, disconnect) the signal goes stale on its own and the 650ms timeout proceeds
-   — no stuck-on layer.
-2. **Never re-asserts a dropped layer:** keep-alive only refreshes `last_activity` (never
-   `layer_on`), and the reconcile actively deactivates when the layer is externally off, so
-   accumulated jitter cannot resurrect the layer the keymap just dropped.
+   (bus error, disconnect — its call site sits after early `return false` paths) the signal
+   goes stale on its own and the 650ms timeout proceeds — no stuck-on layer.
+2. **Gated on the real layer, so it never re-asserts a dropped layer.** The contact term
+   only refreshes `last_activity` while `layer_state_is(AUTOMOUSE_LAYER)` is true. After the
+   keymap's typing-guard `layer_off`s the layer, `layer_state_is` is false → the contact
+   term is inert → the normal 650ms timeout runs and `automouse_deactivate` resets the motion
+   accumulators exactly as pre-patch. Resting-finger drift therefore cannot accumulate
+   unbounded into a phantom re-activation. (Gating on `is_active` instead would *not* work:
+   `is_active` stays true after an external `layer_off`, so the term would keep refreshing
+   `last_activity`, suppress the timeout/reset forever, and let drift resurrect the layer —
+   this is the bug the layer-state gate fixes.)
 
 ### Patch B — `navigator_trackpad` module (`navigator_trackpad/navigator_trackpad_ptp.c`)
 
@@ -134,20 +145,23 @@ untouched and still take precedence.
 ## Recovery / interaction with the existing instant-drop
 
 The prior spec (`2026-06-19…`, "Recovery") established that the layer is re-asserted **only**
-by new motion crossing the threshold. With the reconcile added here, the typed-off path is
-now provably clean:
+by new motion crossing the threshold. Gating the contact term on `layer_state_is` makes the
+typed-off path identical to pre-patch behavior:
 
-- User mouses → layer active → types a non-click key → keymap `layer_off`s the layer.
-- Next automouse task tick observes `is_active && !layer_state_is(AUTOMOUSE_LAYER)` →
-  `automouse_deactivate()` → `is_active = false`, motion accumulators zeroed.
-- Finger keeps resting: `finger_present` is true but keep-alive is gated on `is_active`
-  (now false) → no-op. Critically, with accumulators reset, residual sensor jitter can no
-  longer creep across `AUTOMOUSE_THRESHOLD` to call `layer_on`. The layer **stays off**
-  until a real new motion gesture — the same recovery rule the keymap relies on.
-- Finger lifts → contact goes stale/false → module timeout → `automouse_deactivate` (no-op).
+- User mouses → layer on (`is_active = true`) → types a non-click key → keymap `layer_off`s
+  the layer. `is_active` stays true (the module isn't told), but `layer_state_is` is now false.
+- Finger keeps resting: the contact keep-alive term is gated on `layer_state_is`, so it is
+  **inert** while the layer is off — it does not refresh `last_activity`. With nothing
+  refreshing the timer, the existing 650ms timeout fires `automouse_deactivate()`, which
+  zeros the motion accumulators — **exactly the pre-patch reset cadence**. Resting-finger
+  drift gets the same bounded ≤650ms window it had before this feature; it cannot accumulate
+  unbounded into a phantom `layer_on`.
+- Finger lifts → contact goes stale/false anyway → no change to the above.
 
-So contact only ever extends the warm window while the layer is genuinely active, and can
-neither fight nor undo the keymap's typing-drop.
+So contact only ever extends the warm window while the layer is genuinely **on**, and the
+typed-off case is no worse than the shipped 2026-06-19 behavior. (Any residual
+resurrection-from-drift after a deactivation is a pre-existing automouse characteristic,
+unchanged by — and out of scope for — this patch.)
 
 ## Build-resolution model (corrected from v1)
 
@@ -237,7 +251,8 @@ firmware-version bumps or ZSA re-pins — cheap insurance, not a fire alarm.
   remain clicks. Previously dropped after 650ms.
 - Lift the finger → 650ms later the layer drops (unchanged timeout).
 - Type a non-click key while warm → layer drops instantly (unchanged keymap guard), even
-  with a finger still resting (reconcile + reset prevents resurrection).
+  with a finger still resting (contact term is gated on `layer_state_is`, so it goes inert
+  and the normal timeout/reset runs — no resurrection).
 - Move again after any drop → layer re-activates on threshold (unchanged).
 - Bus error / disconnect while resting → contact goes stale within ~120ms → layer follows
   the normal 650ms timeout rather than sticking on.
@@ -247,11 +262,15 @@ firmware-version bumps or ZSA re-pins — cheap insurance, not a fire alarm.
 - **[MAJOR] Stuck-on via bus error.** The trackpad contact call sits after early
   `return false` paths; a glitch while a finger rests could leave a pure latch stuck true →
   layer warm forever. **Closed by** the self-decaying timestamp (`AUTOMOUSE_CONTACT_STALE_MS`).
-- **[MAJOR] Jitter resurrects a typed-off layer.** Keeping `is_active` true forever stops
-  `automouse_deactivate` from resetting the motion accumulators, so resting-finger jitter
-  could re-cross threshold and `layer_on` a layer the keymap just dropped. **Closed by** the
-  `is_active`↔layer reconcile that deactivates (and resets accumulators) when the layer is
-  externally off.
+- **[MAJOR] Jitter resurrects a typed-off layer.** If the contact term refreshed
+  `last_activity` whenever `is_active` was true, it would suppress the timeout/reset forever
+  after the keymap externally `layer_off`s — letting resting-finger drift re-cross threshold
+  and `layer_on` a layer the user just dropped. **Closed by** gating the contact term on
+  `layer_state_is(AUTOMOUSE_LAYER)`: while the layer is off the term is inert, so the normal
+  650ms timeout + accumulator reset runs exactly as pre-patch. (A v2 design that called
+  `automouse_deactivate` on the `is_active && !layer_state_is` transition was found
+  insufficient: once `is_active` flipped false the reconcile stopped firing and drift could
+  re-accumulate from zero.)
 - **[MAJOR] In-container `git apply` fails / setup clobber / patch visibility.** **Closed by**
   `patch -p1` on patches copied into the mounted tree, applied after `qmk setup`, before
   `make`.
