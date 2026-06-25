@@ -95,8 +95,9 @@ jobs:
       - name: Build the layout
         id: build-layout
         run: |
+          fw="${{ steps.download-layout-source.outputs.firmware_version }}"
           # Set keyboard directory and make prefix based on firmware version
-          if [ "${{ steps.download-layout-source.outputs.firmware_version }}" -ge 24 ]; then
+          if [ "$fw" -ge 24 ]; then
             keyboard_directory="qmk_firmware/keyboards/zsa"
             make_prefix="zsa/"
           else
@@ -108,13 +109,30 @@ jobs:
           rm -rf ${keyboard_directory}/${{ github.event.inputs.layout_geometry }}/keymaps/${{ github.event.inputs.layout_id }}
           mkdir -p ${keyboard_directory}/${{ github.event.inputs.layout_geometry }}/keymaps && cp -r ${{ github.event.inputs.layout_id }} "$_"
 
-          # Build the layout
+          # Stage the trackpad contact-keepalive patches for in-container apply.
+          # Only for JRZ6Q + firmware>=24; the apply script also self-skips if the ZSA
+          # modules are absent, so any other geometry/layout builds untouched.
+          rm -rf qmk_firmware/_contact_patches qmk_firmware/_contact_apply.sh
+          if [ "${{ github.event.inputs.layout_id }}" = "JRZ6Q" ] && [ "$fw" -ge 24 ]; then
+            cp -r patches qmk_firmware/_contact_patches
+            cp scripts/apply-contact-patches.sh qmk_firmware/_contact_apply.sh
+            echo "Staged contact-keepalive patches"
+          fi
+
+          # Build the layout. The patch apply runs AFTER qmk setup (which may re-sync the
+          # modules submodule) and BEFORE make; `|| exit 1` makes an apply failure fail the
+          # build (no artifact) rather than silently shipping unpatched firmware.
           docker run -v ./qmk_firmware:/root --rm qmk /bin/sh -c "
-            qmk setup zsa/qmk_firmware -b firmware${{ steps.download-layout-source.outputs.firmware_version }} -y
+            qmk setup zsa/qmk_firmware -b firmware${fw} -y
+            if [ -d /root/_contact_patches ]; then
+              sh /root/_contact_apply.sh /root/modules/zsa /root/_contact_patches || exit 1
+            elif [ "${{ github.event.inputs.layout_id }}" = "JRZ6Q" ] && [ "${fw}" -ge 24 ]; then
+              echo "::error::contact-keepalive: staged patches missing before apply (qmk setup cleaned the mounted volume?)"; exit 1
+            fi
             make ${make_prefix}${{ github.event.inputs.layout_geometry }}:${{ github.event.inputs.layout_id }}
           "
 
-          # Find and export built layout          
+          # Find and export built layout
           normalized_layout_geometry="$(echo "${{ github.event.inputs.layout_geometry }}" | sed 's/\//_/g')"
           echo built_layout_file=$(find ./qmk_firmware -maxdepth 1 -type f -regex ".*${normalized_layout_geometry}.*\.\(bin\|hex\)$") >> "$GITHUB_OUTPUT"
           echo normalized_layout_geometry=${normalized_layout_geometry} >> "$GITHUB_OUTPUT"
