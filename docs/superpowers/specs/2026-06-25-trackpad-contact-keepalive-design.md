@@ -203,16 +203,18 @@ patches/
   commits the patched tree — `git add qmk_firmware` stages only the submodule gitlink SHA,
   never working-tree file content — so patched modules can never leak into the repo.
 
-## Proactive monitoring — nightly canary
+## Proactive monitoring — weekly canary
 
 A **separate, scheduled, read-only** workflow (`.github/workflows/patch-canary.yml`) that
 detects patch breakage on a schedule rather than at the moment a real build is needed. Given
 the corrected build model, it will be **mostly idle**, firing meaningfully around
-firmware-version bumps or ZSA re-pins — cheap insurance, not a daily fire alarm.
+firmware-version bumps or ZSA re-pins — cheap insurance, not a fire alarm.
 
-- **Schedule:** daily, early morning (`on: schedule: cron`, UTC — one line, user-tweakable).
-  `schedule:` triggers run only on the **default branch's** copy, so the workflow and
-  `patches/` must live on `main` (they will).
+- **Schedule:** weekly, Monday early morning (`on: schedule: - cron: '0 6 * * 1'`, UTC —
+  one line, user-tweakable). Weekly (not daily) because the corrected build model makes
+  breakage rare and firmware-bump-clustered; a 7-day detection window still lands well
+  before a real build is typically needed. `schedule:` triggers run only on the **default
+  branch's** copy, so the workflow and `patches/` must live on `main` (they will).
 - **Resolves modules exactly as the build does:** `submodule update --init` qmk_firmware →
   `checkout firmware${VERSION}` → `submodule update --init --recursive` (**no `--remote`**),
   then `patch -p1`. Uses the committed `JRZ6Q/` layout to `make` (bonus compile).
