@@ -1,8 +1,8 @@
 diff --git a/navigator_trackpad/navigator_trackpad_ptp.c b/navigator_trackpad/navigator_trackpad_ptp.c
-index 488c2b1..ee2a705 100644
+index 488c2b1..88ba458 100644
 --- a/navigator_trackpad/navigator_trackpad_ptp.c
 +++ b/navigator_trackpad/navigator_trackpad_ptp.c
-@@ -89,6 +89,10 @@ extern uint8_t digitizer_touchpad_get_input_mode(void);
+@@ -89,6 +89,23 @@ extern uint8_t digitizer_touchpad_get_input_mode(void);
  #    define TRACKPAD_TAP_SETTLE_TIME_MS 30  // Ignore movement during initial contact (ms)
  #endif
  
@@ -10,10 +10,23 @@ index 488c2b1..ee2a705 100644
 +#    define TRACKPAD_SCROLL_SENSITIVITY 0.10f  // two-finger scroll: sensor-units → wheel-clicks; tune on-device
 +#endif
 +
++// This pad presents to macOS as a MOUSE in mode 0, so its scroll direction is governed by
++// the macOS Mouse natural-scroll setting, not the Trackpad one. With TRACKPAD_SCROLL_NATURAL=1
++// (default) the wheel is inverted here so content follows the fingers (trackpad-style) while
++// macOS Mouse natural-scroll stays OFF — letting a real mouse keep traditional scrolling.
++#ifndef TRACKPAD_SCROLL_NATURAL
++#    define TRACKPAD_SCROLL_NATURAL 1
++#endif
++#if TRACKPAD_SCROLL_NATURAL
++#    define _NT_SCROLL_SIGN (-1)
++#else
++#    define _NT_SCROLL_SIGN (1)
++#endif
++
  #ifndef TRACKPAD_MAX_DELTA
  #    define TRACKPAD_MAX_DELTA 250  // Max allowed delta per frame to prevent jumps
  #endif
-@@ -168,6 +172,18 @@ static struct {
+@@ -168,6 +185,18 @@ static struct {
      uint8_t  prev_buttons;
  } mouse_state = {0};
  
@@ -32,7 +45,7 @@ index 488c2b1..ee2a705 100644
  // Track input mode to detect changes
  static uint8_t prev_input_mode = TRACKPAD_INPUT_MODE_PTP;
  
-@@ -196,6 +212,10 @@ static void reset_mouse_state(void) {
+@@ -196,6 +225,10 @@ static void reset_mouse_state(void) {
      mouse_state.is_drag = false;
      mouse_state.pending_release = false;
      mouse_state.prev_buttons = 0;
@@ -43,7 +56,7 @@ index 488c2b1..ee2a705 100644
  }
  
  // Clamp value to int8_t range
-@@ -212,6 +232,88 @@ static void process_fallback_mouse(cgen6_report_t *sensor_report, bool finger_do
+@@ -212,6 +245,88 @@ static void process_fallback_mouse(cgen6_report_t *sensor_report, bool finger_do
      int8_t dy = 0;
      uint8_t buttons = 0;
  
@@ -101,8 +114,8 @@ index 488c2b1..ee2a705 100644
 +
 +        // Vertical wheel from Δy, horizontal from Δx. The sign on v is the on-device
 +        // tunable (flip if inverted); macOS natural-scroll applies on top.
-+        scroll_state.v_accum += (float)(-raw_dy) * TRACKPAD_SCROLL_SENSITIVITY;
-+        scroll_state.h_accum += (float)( raw_dx) * TRACKPAD_SCROLL_SENSITIVITY;
++        scroll_state.v_accum += (float)(_NT_SCROLL_SIGN * -raw_dy) * TRACKPAD_SCROLL_SENSITIVITY;
++        scroll_state.h_accum += (float)(_NT_SCROLL_SIGN *  raw_dx) * TRACKPAD_SCROLL_SENSITIVITY;
 +
 +        int8_t v = clamp_to_int8((int32_t)scroll_state.v_accum);
 +        int8_t h = clamp_to_int8((int32_t)scroll_state.h_accum);
