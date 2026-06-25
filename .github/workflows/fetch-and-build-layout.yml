@@ -126,8 +126,8 @@ jobs:
             qmk setup zsa/qmk_firmware -b firmware${fw} -y
             if [ -d /root/_contact_patches ]; then
               sh /root/_contact_apply.sh /root/modules/zsa /root/_contact_patches || exit 1
-            elif [ "${{ github.event.inputs.layout_id }}" = "JRZ6Q" ] && [ "${fw}" -ge 24 ]; then
-              echo "::error::contact-keepalive: staged patches missing before apply (qmk setup cleaned the mounted volume?)"; exit 1
+            elif [ ${{ github.event.inputs.layout_id }} = JRZ6Q ] && [ ${fw} -ge 24 ]; then
+              echo '::error::contact-keepalive: staged patches missing before apply (qmk setup cleaned the mounted volume)'; exit 1
             fi
             make ${make_prefix}${{ github.event.inputs.layout_geometry }}:${{ github.event.inputs.layout_id }}
           "
