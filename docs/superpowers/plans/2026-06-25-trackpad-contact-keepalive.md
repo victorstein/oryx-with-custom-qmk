@@ -732,3 +732,15 @@ After merging and running the real **Fetch and build layout** Action, flash the 
 **Placeholder scan:** none — every code block is complete, every command has expected output.
 
 **Type/name consistency:** `automouse_report_contact(bool)` declared (Task 2.1), defined (Task 2.4), called (Task 3.1); `finger_present`/`last_contact`/`AUTOMOUSE_CONTACT_STALE_MS` defined and used in the same Task 2 block; `scripts/apply-contact-patches.sh` signature `<modules_zsa_dir> <patches_dir>` consistent across Task 4, Task 6, Task 7; sentinel marker `CONTACT_PATCH_APPLY_FAILED` emitted (Task 4) and grepped (Task 7). ✓
+
+---
+
+## Implementation deltas (applied during subagent review, vs. the task text above)
+
+Recorded for accuracy — the committed code reflects these; the task code blocks above predate them:
+
+- **Task 2 (automouse.h):** the `automouse_report_contact` declaration parameter is `bool present` (matches the definition), not `bool finger_present` — avoids visually shadowing the file-static `finger_present`. (Code-quality, Minor.)
+- **Task 4 (apply script):** in each failure branch the marker and the annotation are emitted on **separate lines** (`echo "CONTACT_PATCH_APPLY_FAILED"` then `echo "::error::..."`) — GitHub Actions only parses `::error::`/`::notice::` when it begins a line. Also the real apply is wrapped `if ! patch ...; then <marker+error>; exit 1; fi` so a post-dry-run failure still emits the marker. (Code-quality, Important + hardening.)
+- **Task 4 Step 6 (test):** the corruption `sed` must target a real **context** line (e.g. `s/static bool layer_held_externally/.../`), not an added (`+`) line, to actually break the dry-run.
+- **Task 6 (build workflow):** the in-container apply adds an `elif [ "${{ github.event.inputs.layout_id }}" = "JRZ6Q" ] && [ "${fw}" -ge 24 ]; then echo "::error::...staged patches missing..."; exit 1; fi` so that if the staged patches ever vanish before apply (e.g. a future `qmk setup` cleaning the volume) the build fails loudly instead of silently shipping unpatched. (Code-quality, Minor hardening.)
+- **Task 7 (canary):** two runtime fixes for the default `bash -e -o pipefail` shell — (1) `|| true` on the `v=$(curl | jq ...)` firmware-resolution assignment so an Oryx outage falls back to `fw=25` instead of aborting (which would file a spurious issue); (2) the dedup jq filter is `.[0].number // empty` (not `.[0].number`) so an empty issue list yields `existing=""` and the **first** alert issue is actually created (bare `.[0].number` prints the string `null`). (Code-quality, Critical + Important.)
