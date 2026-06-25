@@ -15,5 +15,7 @@
 #undef  TRACKPAD_MOUSE_ACCELERATION
 #define TRACKPAD_MOUSE_ACCELERATION 1.3f
 
+#define TRACKPAD_SCROLL_SENSITIVITY 0.06f  // two-finger scroll speed (patch default 0.10); lower = slower
+
 #define RGB_MATRIX_STARTUP_SPD 60
 
