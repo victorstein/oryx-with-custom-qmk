@@ -1,0 +1,99 @@
+name: Patch canary
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC — bump/retune freely
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_TITLE: "🔴 contact-keepalive patch canary failing"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Resolve firmware version from Oryx (same source as the build)
+        id: fw
+        run: |
+          v=$(curl -s 'https://oryx.zsa.io/graphql' \
+                --header 'Content-Type: application/json' \
+                --data '{"query":"query getLayout($hashId: String!, $geometry: String) { layout(hashId: $hashId, geometry: $geometry, revisionId: \"latest\") { revision { qmkVersion } } }","variables":{"hashId":"JRZ6Q","geometry":"voyager"}}' \
+                | jq -r '.data.layout.revision.qmkVersion' 2>/dev/null) || true
+          fw=$(printf "%.0f" "$v" 2>/dev/null || echo "")
+          if ! [ "$fw" -ge 24 ] 2>/dev/null; then fw=25; fi
+          echo "fw=$fw" >> "$GITHUB_OUTPUT"
+          echo "Resolved firmware branch: firmware$fw"
+
+      - name: Resolve modules exactly as the build does (firmwareXX pin, no --remote)
+        run: |
+          fw="${{ steps.fw.outputs.fw }}"
+          git submodule update --init --depth=1 qmk_firmware
+          cd qmk_firmware
+          git fetch --depth=1 origin "firmware${fw}"
+          git checkout -B "firmware${fw}" "origin/firmware${fw}"
+          git submodule update --init --recursive
+          cd ..
+
+      - name: Stage layout + patches (mirror the build)
+        run: |
+          mkdir -p qmk_firmware/keyboards/zsa/voyager/keymaps
+          rm -rf qmk_firmware/keyboards/zsa/voyager/keymaps/JRZ6Q
+          cp -r JRZ6Q qmk_firmware/keyboards/zsa/voyager/keymaps/JRZ6Q
+          cp -r patches qmk_firmware/_contact_patches
+          cp scripts/apply-contact-patches.sh qmk_firmware/_contact_apply.sh
+
+      - name: Build qmk docker image
+        run: docker build -t qmk .
+
+      - name: Apply patches + compile (classify failure phase)
+        id: build
+        run: |
+          fw="${{ steps.fw.outputs.fw }}"
+          set +e
+          docker run -v ./qmk_firmware:/root --rm qmk /bin/sh -c "
+            qmk setup zsa/qmk_firmware -b firmware${fw} -y
+            sh /root/_contact_apply.sh /root/modules/zsa /root/_contact_patches || exit 1
+            make zsa/voyager:JRZ6Q
+          " 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if grep -q CONTACT_PATCH_APPLY_FAILED build.log; then
+              echo "phase=apply" >> "$GITHUB_OUTPUT"
+            else
+              echo "phase=compile" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open or update the alert issue on failure
+        if: steps.build.outputs.rc != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          phase="${{ steps.build.outputs.phase }}"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "$phase" = "apply" ]; then
+            body="The contact-keepalive **patch no longer applies** against the current \`modules/zsa\` (firmware${{ steps.fw.outputs.fw }} pin). Refresh the patch context per \`patches/README.md\`. Run: $run_url"
+          else
+            body="The contact-keepalive patches **apply but the firmware no longer compiles** (likely an upstream symbol/signature change). Investigate the patched code. Run: $run_url"
+          fi
+          existing=$(gh issue list --search "in:title \"$ISSUE_TITLE\" is:open" --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body "$body"
+          fi
+
+      - name: Fail the job (also triggers GitHub's scheduled-failure email)
+        if: steps.build.outputs.rc != '0'
+        run: exit 1
