@@ -1,0 +1,134 @@
+diff --git a/navigator_trackpad/navigator_trackpad_ptp.c b/navigator_trackpad/navigator_trackpad_ptp.c
+index 488c2b1..ee2a705 100644
+--- a/navigator_trackpad/navigator_trackpad_ptp.c
++++ b/navigator_trackpad/navigator_trackpad_ptp.c
+@@ -89,6 +89,10 @@ extern uint8_t digitizer_touchpad_get_input_mode(void);
+ #    define TRACKPAD_TAP_SETTLE_TIME_MS 30  // Ignore movement during initial contact (ms)
+ #endif
+ 
++#ifndef TRACKPAD_SCROLL_SENSITIVITY
++#    define TRACKPAD_SCROLL_SENSITIVITY 0.10f  // two-finger scroll: sensor-units → wheel-clicks; tune on-device
++#endif
++
+ #ifndef TRACKPAD_MAX_DELTA
+ #    define TRACKPAD_MAX_DELTA 250  // Max allowed delta per frame to prevent jumps
+ #endif
+@@ -168,6 +172,18 @@ static struct {
+     uint8_t  prev_buttons;
+ } mouse_state = {0};
+ 
++// Two-finger scroll state. Tracks the CENTROID of the two contacts; the centroid is
++// order-independent, so packet slot-swaps need no special handling.
++static struct {
++    bool     active;
++    bool     settled;
++    uint32_t start_time;
++    uint16_t prev_cx;
++    uint16_t prev_cy;
++    float    v_accum;
++    float    h_accum;
++} scroll_state = {0};
++
+ // Track input mode to detect changes
+ static uint8_t prev_input_mode = TRACKPAD_INPUT_MODE_PTP;
+ 
+@@ -196,6 +212,10 @@ static void reset_mouse_state(void) {
+     mouse_state.is_drag = false;
+     mouse_state.pending_release = false;
+     mouse_state.prev_buttons = 0;
++    scroll_state.active  = false;
++    scroll_state.settled = false;
++    scroll_state.v_accum = 0.0f;
++    scroll_state.h_accum = 0.0f;
+ }
+ 
+ // Clamp value to int8_t range
+@@ -212,6 +232,88 @@ static void process_fallback_mouse(cgen6_report_t *sensor_report, bool finger_do
+     int8_t dy = 0;
+     uint8_t buttons = 0;
+ 
++    // --- Two-finger scroll (mode-0 fallback) ---
++    // While two fingers are down, scroll instead of moving the cursor. Emitted as a
++    // standard mouse wheel report on the dedicated mouse interface (host_mouse_send),
++    // which macOS consumes natively; cursor stays on the digitizer interface.
++    // Only the lowest 2 sensor slots are inspected, so 3+ fingers also read as 2 here
++    // and intentionally fall through to scroll (Phase 1 has no 3-finger gesture).
++    uint8_t finger_count = sensor_report->fingers[0].tip + sensor_report->fingers[1].tip;
++    if (finger_count == 2) {
++        uint16_t cx = ((uint16_t)sensor_report->fingers[0].x + (uint16_t)sensor_report->fingers[1].x) / 2;
++        uint16_t cy = ((uint16_t)sensor_report->fingers[0].y + (uint16_t)sensor_report->fingers[1].y) / 2;
++
++        if (!scroll_state.active) {
++            // Entering a scroll gesture: cancel any single-finger cursor/click state so
++            // a held click or in-progress drag doesn't leak into the scroll.
++            if (mouse_state.prev_buttons != 0 || mouse_state.pending_release) {
++                send_mouse_report(0, 0, 0);
++            }
++            mouse_state.prev_buttons    = 0;
++            mouse_state.pending_release = false;
++            mouse_state.tracking        = false;
++            mouse_state.is_drag         = false;
++            scroll_state.active     = true;
++            scroll_state.settled    = false;
++            scroll_state.start_time = timer_read32();
++            scroll_state.prev_cx    = cx;
++            scroll_state.prev_cy    = cy;
++            scroll_state.v_accum    = 0.0f;
++            scroll_state.h_accum    = 0.0f;
++            return;  // seed only; no scroll on the first frame
++        }
++
++        // Settle: ignore jitter during the first TRACKPAD_TAP_SETTLE_TIME_MS.
++        if (!scroll_state.settled) {
++            if (timer_elapsed32(scroll_state.start_time) >= TRACKPAD_TAP_SETTLE_TIME_MS) {
++                scroll_state.settled = true;
++                scroll_state.prev_cx = cx;
++                scroll_state.prev_cy = cy;
++            }
++            return;
++        }
++
++        int16_t raw_dx = (int16_t)cx - (int16_t)scroll_state.prev_cx;
++        int16_t raw_dy = (int16_t)cy - (int16_t)scroll_state.prev_cy;
++        scroll_state.prev_cx = cx;
++        scroll_state.prev_cy = cy;
++
++        // Reject implausible jumps (a contact being replaced mid-gesture).
++        if (raw_dx >  TRACKPAD_MAX_DELTA) raw_dx =  TRACKPAD_MAX_DELTA;
++        if (raw_dx < -TRACKPAD_MAX_DELTA) raw_dx = -TRACKPAD_MAX_DELTA;
++        if (raw_dy >  TRACKPAD_MAX_DELTA) raw_dy =  TRACKPAD_MAX_DELTA;
++        if (raw_dy < -TRACKPAD_MAX_DELTA) raw_dy = -TRACKPAD_MAX_DELTA;
++
++        // Vertical wheel from Δy, horizontal from Δx. The sign on v is the on-device
++        // tunable (flip if inverted); macOS natural-scroll applies on top.
++        scroll_state.v_accum += (float)(-raw_dy) * TRACKPAD_SCROLL_SENSITIVITY;
++        scroll_state.h_accum += (float)( raw_dx) * TRACKPAD_SCROLL_SENSITIVITY;
++
++        int8_t v = clamp_to_int8((int32_t)scroll_state.v_accum);
++        int8_t h = clamp_to_int8((int32_t)scroll_state.h_accum);
++        scroll_state.v_accum -= v;
++        scroll_state.h_accum -= h;
++
++        if (v != 0 || h != 0) {
++            report_mouse_t r = {0};
++            r.buttons = mousekey_get_report().buttons;  // preserve held W/E/R clicks
++            r.v = v;
++            r.h = h;
++            host_mouse_send(&r);
++        }
++        return;
++    }
++
++    // Leaving a scroll gesture (finger count dropped below 2): clear scroll state and
++    // force the cursor path to re-seed on the next genuine finger-down.
++    if (scroll_state.active) {
++        scroll_state.active  = false;
++        scroll_state.settled = false;
++        scroll_state.v_accum = 0.0f;
++        scroll_state.h_accum = 0.0f;
++        mouse_state.tracking = false;
++    }
++
+     // Handle pending click release from previous cycle (like mouse mode)
+     if (mouse_state.pending_release) {
+         mouse_state.pending_release = false;

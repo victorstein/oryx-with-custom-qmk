@@ -83,9 +83,9 @@ jobs:
           phase="${{ steps.build.outputs.phase }}"
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ "$phase" = "apply" ]; then
-            body="The contact-keepalive **patch no longer applies** against the current \`modules/zsa\` (firmware${{ steps.fw.outputs.fw }} pin). Refresh the patch context per \`patches/README.md\`. Run: $run_url"
+            body="A trackpad **module patch no longer applies** against the current \`modules/zsa\` (firmware${{ steps.fw.outputs.fw }} pin) — see the run log for which one. Refresh the patch context per \`patches/README.md\`. Run: $run_url"
           else
-            body="The contact-keepalive patches **apply but the firmware no longer compiles** (likely an upstream symbol/signature change). Investigate the patched code. Run: $run_url"
+            body="The trackpad module patches **apply but the firmware no longer compiles** (likely an upstream symbol/signature change). Investigate the patched code. Run: $run_url"
           fi
           existing=$(gh issue list --search "in:title \"$ISSUE_TITLE\" is:open" --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
           if [ -n "$existing" ]; then
