@@ -6,5 +6,6 @@
 #define AUTOMOUSE_LAYER 5
 #define AUTOMOUSE_TIMEOUT 250
 #define AUTOMOUSE_THRESHOLD 10
+#define TRACKPAD_TAP_TERM_MS 0  // disable firmware tap-to-click (mouse-fallback mode); 0 = no tap qualifies
 #define RGB_MATRIX_STARTUP_SPD 60
 
