@@ -1,8 +1,8 @@
 diff --git a/navigator_trackpad/navigator_trackpad_ptp.c b/navigator_trackpad/navigator_trackpad_ptp.c
-index 488c2b1..88ba458 100644
+index 488c2b1..7042481 100644
 --- a/navigator_trackpad/navigator_trackpad_ptp.c
 +++ b/navigator_trackpad/navigator_trackpad_ptp.c
-@@ -89,6 +89,23 @@ extern uint8_t digitizer_touchpad_get_input_mode(void);
+@@ -89,6 +89,37 @@ extern uint8_t digitizer_touchpad_get_input_mode(void);
  #    define TRACKPAD_TAP_SETTLE_TIME_MS 30  // Ignore movement during initial contact (ms)
  #endif
  
@@ -23,10 +23,24 @@ index 488c2b1..88ba458 100644
 +#    define _NT_SCROLL_SIGN (1)
 +#endif
 +
++#ifndef TRACKPAD_SCROLL_MOMENTUM
++#    define TRACKPAD_SCROLL_MOMENTUM 1          // master on/off for kinetic coasting
++#endif
++#ifndef TRACKPAD_SCROLL_DECAY
++#    define TRACKPAD_SCROLL_DECAY 0.95f         // velocity *= DECAY per 5ms tick (higher = floatier)
++#endif
++#ifndef TRACKPAD_SCROLL_MOMENTUM_MIN
++#    define TRACKPAD_SCROLL_MOMENTUM_MIN 0.05f  // start/stop velocity threshold (wheel-units/tick)
++#endif
++#ifndef TRACKPAD_SCROLL_LIFT_GRACE_MS
++#    define TRACKPAD_SCROLL_LIFT_GRACE_MS 90    // window after scroll where a residual finger = lift, not point
++#endif
++#define _NT_SCROLL_VEL_ALPHA 0.5f               // internal EMA weight for lift-off velocity
++
  #ifndef TRACKPAD_MAX_DELTA
  #    define TRACKPAD_MAX_DELTA 250  // Max allowed delta per frame to prevent jumps
  #endif
-@@ -168,6 +185,18 @@ static struct {
+@@ -168,6 +199,23 @@ static struct {
      uint8_t  prev_buttons;
  } mouse_state = {0};
  
@@ -40,23 +54,72 @@ index 488c2b1..88ba458 100644
 +    uint16_t prev_cy;
 +    float    v_accum;
 +    float    h_accum;
++    float    vel_v;             // smoothed scroll velocity (wheel-units/tick)
++    float    vel_h;
++    bool     coasting;          // a coast is in progress (driven by the task idle loop)
++    bool     lift_armed;        // recently scrolling; eligible to start a coast on full lift
++    uint32_t last_scroll_time;  // timer of the last 2-finger emit (for the lift grace)
 +} scroll_state = {0};
 +
  // Track input mode to detect changes
  static uint8_t prev_input_mode = TRACKPAD_INPUT_MODE_PTP;
  
-@@ -196,6 +225,10 @@ static void reset_mouse_state(void) {
+@@ -196,6 +244,14 @@ static void reset_mouse_state(void) {
      mouse_state.is_drag = false;
      mouse_state.pending_release = false;
      mouse_state.prev_buttons = 0;
-+    scroll_state.active  = false;
-+    scroll_state.settled = false;
-+    scroll_state.v_accum = 0.0f;
-+    scroll_state.h_accum = 0.0f;
++    scroll_state.active   = false;
++    scroll_state.settled  = false;
++    scroll_state.v_accum  = 0.0f;
++    scroll_state.h_accum  = 0.0f;
++    scroll_state.vel_v    = 0.0f;
++    scroll_state.vel_h    = 0.0f;
++    scroll_state.coasting = false;
++    scroll_state.lift_armed = false;
  }
  
  // Clamp value to int8_t range
-@@ -212,6 +245,88 @@ static void process_fallback_mouse(cgen6_report_t *sensor_report, bool finger_do
+@@ -205,6 +261,39 @@ static inline int8_t clamp_to_int8(int32_t value) {
+     return (int8_t)value;
+ }
+ 
++#if TRACKPAD_SCROLL_MOMENTUM
++// One momentum step: decay velocity, emit a wheel report, stop below the threshold.
++// Driven from the task idle branch so it runs while no finger is on the pad.
++static void scroll_coast_tick(void) {
++    if (mousekey_get_report().buttons != 0) {   // a held click catches the coast
++        scroll_state.coasting = false;
++        scroll_state.vel_v = scroll_state.vel_h = 0.0f;
++        return;
++    }
++    scroll_state.vel_v *= TRACKPAD_SCROLL_DECAY;
++    scroll_state.vel_h *= TRACKPAD_SCROLL_DECAY;
++    if (fabsf(scroll_state.vel_v) < TRACKPAD_SCROLL_MOMENTUM_MIN &&
++        fabsf(scroll_state.vel_h) < TRACKPAD_SCROLL_MOMENTUM_MIN) {
++        scroll_state.coasting = false;
++        scroll_state.vel_v = scroll_state.vel_h = 0.0f;
++        scroll_state.v_accum = scroll_state.h_accum = 0.0f;
++        return;
++    }
++    scroll_state.v_accum += scroll_state.vel_v;
++    scroll_state.h_accum += scroll_state.vel_h;
++    int8_t v = clamp_to_int8((int32_t)scroll_state.v_accum);
++    int8_t h = clamp_to_int8((int32_t)scroll_state.h_accum);
++    scroll_state.v_accum -= v;
++    scroll_state.h_accum -= h;
++    if (v != 0 || h != 0) {
++        report_mouse_t r = {0};
++        r.v = v;
++        r.h = h;
++        host_mouse_send(&r);
++    }
++}
++#endif
++
+ // Process fallback mouse movement and tap-to-click
+ // Uses settle time and movement suppression like navigator_trackpad_mouse for smooth operation
+ static void process_fallback_mouse(cgen6_report_t *sensor_report, bool finger_down, bool prev_finger_down) {
+@@ -212,6 +301,142 @@ static void process_fallback_mouse(cgen6_report_t *sensor_report, bool finger_do
      int8_t dy = 0;
      uint8_t buttons = 0;
  
@@ -67,6 +130,11 @@ index 488c2b1..88ba458 100644
 +    // Only the lowest 2 sensor slots are inspected, so 3+ fingers also read as 2 here
 +    // and intentionally fall through to scroll (Phase 1 has no 3-finger gesture).
 +    uint8_t finger_count = sensor_report->fingers[0].tip + sensor_report->fingers[1].tip;
++#if TRACKPAD_SCROLL_MOMENTUM
++    if (scroll_state.coasting && finger_count >= 1) {
++        scroll_state.coasting = false;   // a finger touch catches the coast
++    }
++#endif
 +    if (finger_count == 2) {
 +        uint16_t cx = ((uint16_t)sensor_report->fingers[0].x + (uint16_t)sensor_report->fingers[1].x) / 2;
 +        uint16_t cy = ((uint16_t)sensor_report->fingers[0].y + (uint16_t)sensor_report->fingers[1].y) / 2;
@@ -88,6 +156,12 @@ index 488c2b1..88ba458 100644
 +            scroll_state.prev_cy    = cy;
 +            scroll_state.v_accum    = 0.0f;
 +            scroll_state.h_accum    = 0.0f;
++#if TRACKPAD_SCROLL_MOMENTUM
++            scroll_state.vel_v      = 0.0f;
++            scroll_state.vel_h      = 0.0f;
++            scroll_state.coasting   = false;
++            scroll_state.lift_armed = false;
++#endif
 +            return;  // seed only; no scroll on the first frame
 +        }
 +
@@ -114,8 +188,17 @@ index 488c2b1..88ba458 100644
 +
 +        // Vertical wheel from Δy, horizontal from Δx. The sign on v is the on-device
 +        // tunable (flip if inverted); macOS natural-scroll applies on top.
-+        scroll_state.v_accum += (float)(_NT_SCROLL_SIGN * -raw_dy) * TRACKPAD_SCROLL_SENSITIVITY;
-+        scroll_state.h_accum += (float)(_NT_SCROLL_SIGN *  raw_dx) * TRACKPAD_SCROLL_SENSITIVITY;
++        float inc_v = (float)(_NT_SCROLL_SIGN * -raw_dy) * TRACKPAD_SCROLL_SENSITIVITY;
++        float inc_h = (float)(_NT_SCROLL_SIGN *  raw_dx) * TRACKPAD_SCROLL_SENSITIVITY;
++        scroll_state.v_accum += inc_v;
++        scroll_state.h_accum += inc_h;
++#if TRACKPAD_SCROLL_MOMENTUM
++        // Smooth the per-tick increment into a velocity, and arm a coast for lift-off.
++        scroll_state.vel_v = _NT_SCROLL_VEL_ALPHA * inc_v + (1.0f - _NT_SCROLL_VEL_ALPHA) * scroll_state.vel_v;
++        scroll_state.vel_h = _NT_SCROLL_VEL_ALPHA * inc_h + (1.0f - _NT_SCROLL_VEL_ALPHA) * scroll_state.vel_h;
++        scroll_state.lift_armed       = true;
++        scroll_state.last_scroll_time = timer_read32();
++#endif
 +
 +        int8_t v = clamp_to_int8((int32_t)scroll_state.v_accum);
 +        int8_t h = clamp_to_int8((int32_t)scroll_state.h_accum);
@@ -132,8 +215,8 @@ index 488c2b1..88ba458 100644
 +        return;
 +    }
 +
-+    // Leaving a scroll gesture (finger count dropped below 2): clear scroll state and
-+    // force the cursor path to re-seed on the next genuine finger-down.
++    // Leaving a scroll gesture (finger count dropped below 2): clear active/accum/tracking,
++    // but keep vel_*/lift_armed for the lift-grace + coast arming below.
 +    if (scroll_state.active) {
 +        scroll_state.active  = false;
 +        scroll_state.settled = false;
@@ -142,6 +225,68 @@ index 488c2b1..88ba458 100644
 +        mouse_state.tracking = false;
 +    }
 +
++#if TRACKPAD_SCROLL_MOMENTUM
++    if (scroll_state.lift_armed) {
++        if (finger_count == 0) {                 // full lift → arm a coast if fast enough
++            if (fabsf(scroll_state.vel_v) >= TRACKPAD_SCROLL_MOMENTUM_MIN ||
++                fabsf(scroll_state.vel_h) >= TRACKPAD_SCROLL_MOMENTUM_MIN) {
++                scroll_state.coasting = true;    // the task idle loop drives it from here
++            } else {
++                scroll_state.vel_v = scroll_state.vel_h = 0.0f;
++            }
++            scroll_state.lift_armed = false;
++            scroll_state.v_accum = scroll_state.h_accum = 0.0f;
++            return;
++        }
++        if (timer_elapsed32(scroll_state.last_scroll_time) < TRACKPAD_SCROLL_LIFT_GRACE_MS) {
++            return;                              // residual finger during the lift → suppress cursor
++        }
++        // Grace expired with a finger still down → intentional pointing. The rising-edge
++        // tracker won't re-arm (the finger's been down the whole time), so synthesize a
++        // fresh track-down on the slot-0 residual.
++        scroll_state.lift_armed = false;
++        scroll_state.vel_v = scroll_state.vel_h = 0.0f;
++        if (finger_down) {
++            mouse_state.tracking         = true;
++            mouse_state.last_x           = sensor_report->fingers[0].x;
++            mouse_state.last_y           = sensor_report->fingers[0].y;
++            mouse_state.dx_accum         = 0.0f;
++            mouse_state.dy_accum         = 0.0f;
++            mouse_state.touch_start_time = timer_read32();
++            mouse_state.settled          = false;
++            mouse_state.is_drag          = false;
++        }
++    }
++#endif
++
      // Handle pending click release from previous cycle (like mouse mode)
      if (mouse_state.pending_release) {
          mouse_state.pending_release = false;
+@@ -406,11 +631,27 @@ bool navigator_trackpad_ptp_task(void) {
+             // Dead bus: let the probe/re-init path recover; don't synthesize
+             // lift-offs off a failed transaction.
+             no_data_frames = 0;
++#if TRACKPAD_SCROLL_MOMENTUM
++            scroll_state.coasting = false;   // abandon any coast on a bus error
++            scroll_state.vel_v = scroll_state.vel_h = 0.0f;
++#endif
+             return false;
+         }
+         if (host_contacts.count == 0) {
+             // Pad already idle — nothing to release.
+             no_data_frames = 0;
++#if TRACKPAD_SCROLL_MOMENTUM
++            if (scroll_state.coasting) {
++                // Drive the coast each idle poll. Gate on mode: the mode-change detection
++                // only runs on a successful read, which never happens during an idle coast.
++                if (digitizer_touchpad_get_input_mode() == TRACKPAD_INPUT_MODE_MOUSE) {
++                    scroll_coast_tick();
++                } else {
++                    scroll_state.coasting = false;   // host switched to PTP mid-coast
++                }
++                return false;
++            }
++#endif
+             return false;
+         }
+         // A contact is still tracked but this poll had no packet. Empty reads
