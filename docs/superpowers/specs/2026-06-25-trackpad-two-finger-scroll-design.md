@@ -1,6 +1,13 @@
 # Trackpad: native two-finger scroll + cursor-speed tune (Phase 1) — design
 
 **Date:** 2026-06-25
+**Revision:** v2 — incorporates two-reviewer findings (firmware logic + delivery/blast-radius).
+Material changes from v1: mandate button-preservation via `mousekey_get_report().buttons`;
+`process_fallback_mouse` is a **restructure** (id-keying re-implemented inside it, slot-0
+cursor actively suppressed when 2 fingers down); document that two-finger scroll **activates
+the auto-mouse layer** (accepted for Phase 1); idempotency uses a **portable per-patch grep
+sentinel** (not `patch --reverse`, which lies on macOS BSD patch); correct the cursor-speed
+override mechanism (macro redefinition, benign `-Wmacro-redefined`, `#undef` to silence).
 **Keyboard:** ZSA Voyager (`JRZ6Q`), Oryx + custom-QMK hybrid, Navigator trackpad.
 **Host:** macOS. Build: GitHub Actions → Docker → QMK.
 **Builds on:** `2026-06-25-trackpad-contact-keepalive-design.md` (the CI patch mechanism,
@@ -71,9 +78,20 @@ benefit.
 
 ## Decision — code shape
 
-A patch to `navigator_trackpad_ptp.c`, all changes confined to the mode-0 path
-(`process_fallback_mouse`, `navigator_trackpad_ptp.c:210`). No other mode is touched, so the
-patch is fully dormant while Navigator.app holds the device in PTP mode.
+A patch to `navigator_trackpad_ptp.c`. The scroll logic lives in the mode-0 path
+(`process_fallback_mouse`, `navigator_trackpad_ptp.c:210`), which only runs in mouse mode
+(0), so the patch is fully dormant while Navigator.app holds the device in PTP mode.
+
+**This is a restructure of `process_fallback_mouse`, not just an added branch** (reviewer
+finding). Two things make it more than a bolt-on:
+1. The function receives only the **raw** `sensor_report` (plus slot-0 presence) — *not* the
+   id-keyed contact list that `navigator_trackpad_ptp_task` builds (`:438-460`). So the
+   two-finger path must read `sensor_report->fingers[0..1].{id,tip,x,y}` and maintain **its
+   own** per-id previous-position state. (Finger `.id` is stable across packet slot-swaps,
+   `:434-437`.)
+2. The existing single-finger path keys off **slot 0** and currently runs whenever slot-0 is
+   present — *including while a second finger is down*. So the restructure must **actively
+   suppress** the slot-0 cursor logic when two fingers are present, not just add an `else`.
 
 ### Two-finger detection + scroll branch (inside `process_fallback_mouse`)
 
@@ -82,21 +100,24 @@ patch is fully dormant while Navigator.app holds the device in PTP mode.
 uint8_t n = sensor_report->fingers[0].tip + sensor_report->fingers[1].tip;
 
 if (n == 2) {
-    // --- two-finger scroll ---
-    // Average the two contacts' movement since last frame, keyed on finger .id so a
-    // packet slot-swap doesn't produce a jump (the module already keys on id elsewhere).
-    // Suppress cursor movement; accumulate fractional wheel; emit integer clicks.
+    // --- two-finger scroll --- (slot-0 cursor path is skipped this frame)
+    // Average the two contacts' movement since last frame, keyed on finger .id (maintain a
+    // small per-id prev-pos map local to this function). Accumulate fractional wheel,
+    // emit integer clicks, preserve held mouse buttons:
     //   scroll_accum_v += avg_dy * TRACKPAD_SCROLL_SENSITIVITY;
     //   scroll_accum_h += avg_dx * TRACKPAD_SCROLL_SENSITIVITY;
     //   int8_t v = clamp_to_int8((int32_t)scroll_accum_v); scroll_accum_v -= v;
     //   int8_t h = clamp_to_int8((int32_t)scroll_accum_h); scroll_accum_h -= h;
-    //   if (v || h) { report_mouse_t r = {0}; r.v = v; r.h = h;
-    //                 r.buttons = current_mouse_buttons();  // preserve W/E/R (see note)
-    //                 host_mouse_send(&r); }
+    //   if (v || h) {
+    //       report_mouse_t r = {0};
+    //       r.buttons = mousekey_get_report().buttons;   // preserve W/E/R (mandatory)
+    //       r.v = v; r.h = h;
+    //       host_mouse_send(&r);
+    //   }
 } else if (n == 1) {
     // --- existing single-finger cursor path, unchanged ---
 }
-// n == 0 → existing finger-up handling; reset scroll state + accumulators on 2→other
+// n == 0 → existing finger-up handling
 ```
 
 Reuses the module's existing fractional-accumulator → integer-step technique
@@ -107,19 +128,39 @@ Guards / robustness:
   `TRACKPAD_TAP_SETTLE_TIME_MS` idea) so initial-contact jitter isn't scrolled.
 - **Separation sanity check**: ignore as "scroll" if the two contacts are implausibly far
   apart / close (palm or thumb-base), to avoid false scroll. Tunable threshold.
-- **Slot-swap safety**: track per-contact previous position keyed on `fingers[].id`; if a
-  contact is new (id changed), seed its position without emitting a delta that frame.
-- **Mode reset**: the existing `reset_mouse_state()` (`:187`) gains a reset of the new
-  scroll accumulators/velocity so a mode change can't leave stale state.
+- **Slot-swap / new-contact safety**: track per-contact previous position keyed on
+  `fingers[].id`; when a contact id is newly seen, **seed its position without emitting a
+  delta** that frame.
+- **Per-transition resets (not just on mode change):** clear the scroll accumulators and
+  per-id prev-pos whenever finger count drops below 2 (`2→1`, `2→0`) so a stale delta can't
+  leak when one finger lifts mid-scroll. `reset_mouse_state()` (`:186`, runs only on
+  input-mode change) *also* gains a reset of the new scroll state — but the per-transition
+  resets inside `process_fallback_mouse` are the load-bearing ones.
 
-### Button-sharing note
+### Button-sharing — preserve held buttons (mandatory)
 
-`report_mouse_t` is shared with mousekey (`W`/`E`/`R` = `KC_MS_BTN*`). A wheel report with
-`buttons = 0` would momentarily release a held click. **Resolution:** set `r.buttons` to the
-current mouse-button state when sending wheel (read it from the mousekey report), so wheel
-events never disturb buttons. If reading the live button state proves awkward in the module
-context, the accepted fallback is to leave `buttons = 0` and treat "scroll while holding a
-click" as a rare unsupported combo — the implementation plan picks one and documents it.
+`report_mouse_t` is shared with mousekey (`W`/`E`/`R` = `KC_MS_BTN*`), and `host_mouse_send`
+sends the **full** report — so a wheel report with `buttons = 0` would release a held click.
+There is a clean public getter (`mousekey_get_report()`, `mousekey.h:203`) that holds the
+live button bits for the full press duration, and QMK's loop is cooperative (race-free read).
+So the wheel report **must** set `r.buttons = mousekey_get_report().buttons`. (The v1 "accept
+a rare release" fallback is dropped — it's unnecessary.) Reverse-clobber is also safe:
+`mousekey_task` only re-sends when its own report changed, so it won't cancel our wheel.
+
+### Interaction with the auto-mouse layer (accepted Phase-1 behavior)
+
+The auto-mouse motion feed (`automouse_report_motion`, in the PTP-path block at `:465-494`)
+runs every frame regardless of input mode and watches `cur[0]` motion. During a two-finger
+scroll `cur[0]` is moving, so **scroll will activate / keep warm `AUTOMOUSE_LAYER`** (turning
+`W`/`E`/`R` into clicks). The scroll *emission* (`host_mouse_send`) does **not** feed
+automouse, so there is no thrash loop — but the layer does come on.
+
+For Phase 1 this is **accepted and documented**, not gated: suppressing it cleanly means
+editing the automouse-feed block (the contact patch's region), which would couple the two
+patches and break "author the scroll patch against the pristine `process_fallback_mouse`
+region." The instant-drop-on-typing guard mitigates stray `W`/`E`/`R`-as-click. **If it
+annoys on-device, Phase 2 gates the feed on `cur_n < 2`** (a separate, clearly-scoped change
+to the feed block).
 
 ### Tunable constant (patch-side)
 
@@ -133,13 +174,24 @@ click" as a rare unsupported combo — the implementation plan picks one and doc
 
 The module declares mode-0 cursor shaping `#ifndef`-guarded (`navigator_trackpad/config.h`):
 `TRACKPAD_MOUSE_SENSITIVITY` (0.3f), `TRACKPAD_MOUSE_ACCELERATION` (1.1f). Override in
-`JRZ6Q/config.h` exactly like `AUTOMOUSE_TIMEOUT` (oryx doesn't define them → survives the
-merge):
+`JRZ6Q/config.h` (oryx doesn't define them → survives the merge):
 
 ```c
-#define TRACKPAD_MOUSE_SENSITIVITY 0.6f    // starting point; dial in on-device (~0.5–0.8)
+#undef  TRACKPAD_MOUSE_SENSITIVITY          // silence the redefinition warning (see note)
+#define TRACKPAD_MOUSE_SENSITIVITY 0.6f     // starting point; dial in on-device (~0.5–0.8)
+#undef  TRACKPAD_MOUSE_ACCELERATION
 #define TRACKPAD_MOUSE_ACCELERATION 1.3f
 ```
+
+**Override mechanism (corrected from v1 — not the same as `AUTOMOUSE_TIMEOUT`):** the ZSA
+build appends community-module `config.h` files to `CONFIG_H` *first*
+(`builddefs/build_keyboard.mk:382`) and the keymap `config.h` *last* (`:507`), all forced via
+`-include` in order (`common_rules.mk:274`). So `navigator_trackpad/config.h`'s `#ifndef`
+fires first (sets 0.3f) and `JRZ6Q/config.h` then **redefines** it — the override wins, but
+through macro *redefinition*, producing a benign `-Wmacro-redefined` warning. (Contrast
+`AUTOMOUSE_TIMEOUT`, whose `#ifndef` lives in `automouse.h`, `#include`d *after* the config
+chain → a clean skip with no warning.) The repo/Dockerfile build with no `-Werror`
+(confirmed), so it compiles; the `#undef` above silences the warning cleanly.
 
 These affect **only** mode-0 cursor (the no-app world we're building for); they're inert
 while Navigator.app holds PTP mode.
@@ -154,19 +206,40 @@ Reuses the established CI patch mechanism.
   `navigator_trackpad_ptp.c` than the contact patch (`process_fallback_mouse` vs the PTP
   automouse-feed block), so the two patches apply independently.
 - **`scripts/apply-contact-patches.sh`** — generalize from the hardcoded two-name loop to
-  **apply every `patches/*.patch` (sorted)**, each with the existing loud-fail
-  (`CONTACT_PATCH_APPLY_FAILED` + `::error::`). Replace the single automouse-symbol
-  idempotency sentinel with a **per-patch already-applied check**: if
-  `patch -p1 -d <modules/zsa> --dry-run --reverse < p` succeeds, the patch is already
-  applied → skip; else if a forward `--dry-run` succeeds → apply; else → loud fail. This
-  scales to any number of patches and keeps idempotency for local re-runs. (Trade-off: drops
-  the "upstream shipped the symbol natively → skip-with-notice" nicety; that case now
-  surfaces as a loud apply failure the canary flags, which is acceptable.)
+  **apply every `patches/*.patch` (sorted)**. Per patch: `[ -e "$p" ] || continue` (POSIX
+  nullglob guard); **idempotency via a portable per-patch grep sentinel** (the distinctive
+  symbol the patch introduces — `automouse_report_contact` for the contact patch,
+  `TRACKPAD_SCROLL_SENSITIVITY` for the scroll patch) — if the sentinel is already present in
+  the modules tree, skip; else forward `patch --dry-run` then apply, with the existing
+  loud-fail (`CONTACT_PATCH_APPLY_FAILED` + `::error::`, which the canary greps —
+  `patch-canary.yml:69` — so it MUST stay). Keep the dry-run probes inside `if`/`elif` so
+  `set -e` doesn't abort on a non-zero probe.
+  - **Do NOT use `patch -R/--reverse` for the idempotency probe** (v1 plan): on macOS BSD
+    `patch` it auto-answers the "Ignore -R?" prompt and returns 0 regardless of state, so on
+    a pristine tree it would skip every patch and falsely report success — breaking the
+    documented *local* verify. `grep` is implementation-independent and works on both GNU
+    (CI) and BSD (local macOS) patch. The sentinel approach also **keeps** the "upstream
+    shipped the symbol natively → skip" behavior for free.
+  - The apply *loop* is glob-generalized (no script edit to add a patch); the per-patch
+    sentinel is a small association the script carries (a patch without a registered sentinel
+    falls back to forward-apply, loud-failing if already applied — fine, since CI trees are
+    always fresh and the local refresh procedure clones fresh).
 - **`JRZ6Q/config.h`** — add the cursor-speed defines (and optionally a
   `TRACKPAD_SCROLL_SENSITIVITY` override if the patch default needs tuning).
-- **`patches/README.md`** — list the new patch + its target file.
-- Build workflow and canary already pass the whole `patches/` dir to the apply script, so
-  no workflow change is needed beyond the generalized script.
+- **`patches/README.md`** — list the new patch + its target file + a regen line; and update
+  the script header/sentinel **comments** (they describe the old single-sentinel behavior).
+- Build workflow and canary already `cp -r patches …` and pass the dir to the apply script
+  (`fetch-and-build-layout.yml:117,128`; `patch-canary.yml:50,63`), so a new `*.patch` is
+  auto-picked-up — **no workflow change needed** beyond the generalized script.
+
+**Blast-radius note (accepted):** the build applies all patches "or the build fails (exit 1)".
+A future upstream bump that breaks the **scroll** patch would abort the whole JRZ6Q build —
+taking down the **live, in-`main` contact-keepalive feature** too (no artifact), not just
+scroll. Sorted order applies the contact patches first, so scroll can't block *their* apply,
+but a scroll failure still aborts after they're applied. Accepted given the weekly canary
+catches drift before a real build is needed; the scroll patch is under the same canary
+discipline (the canary compiles JRZ6Q with all patches). Non-JRZ6Q / firmware<24 builds stay
+untouched (the build gate + the script's module-absent skip are unchanged).
 
 ## Verification
 
@@ -189,11 +262,23 @@ Same ladder as contact keep-alive:
   — expected (buttons already work), but only flashing confirms direction + acceleration.
 - **Two-finger robustness** — slot-swaps (→ key on id), touch-down jitter (→ settle time),
   palm/thumb false-scroll (→ separation check). All tunable.
-- **Button-sharing** — wheel reports must preserve button state (see note) or accept the
-  rare scroll-while-clicking combo.
+- **Button-sharing** — wheel reports preserve button state via `mousekey_get_report().buttons`
+  (mandatory; see note).
 - **Stepped wheel coarseness** — HID wheel is integer-stepped; macOS smooths it but it won't
   match the app's pixel-precise scroll. Accepted for Phase 1; momentum (Phase 2) and
   sensitivity tuning improve feel.
+- **Wheel width is governed by `WHEEL_EXTENDED_REPORT`** (not `MOUSE_EXTENDED_REPORT`, which
+  is x/y). Neither is defined here → `.v`/`.h` are int8 → `clamp_to_int8()` is correct. Don't
+  enable the wrong macro when tuning.
+- **Rotation coupling (no-op here, note it):** the cursor path applies `NT_ROTATE_DELTA`
+  (`:273`); `NAVIGATOR_TRACKPAD_ROTATION` defaults to 0 with no override, so it compiles to a
+  no-op. If a rotation is ever configured, apply the same `NT_ROTATE_DELTA` to the averaged
+  scroll delta so scroll axes track cursor axes.
+
+## Source citation corrections (v2)
+`report_mouse_t` / the digitizer report structs are in **`tmk_core/protocol/report.h`** (the
+line numbers cited — `:216`, `:283-291` — are for that file, not `quantum/report.h`).
+`reset_mouse_state` is at `navigator_trackpad_ptp.c:186`.
 
 ## Out of scope (Phase 1)
 
