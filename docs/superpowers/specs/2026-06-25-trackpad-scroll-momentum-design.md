@@ -1,7 +1,13 @@
 # Trackpad: two-finger scroll momentum / kinetic coasting (Phase 2) — design
 
 **Date:** 2026-06-25
-**Revision:** v2 — **reworked after an adversarial review found the v1 design non-functional.**
+**Revision:** v3 — adversarial re-review of v2 confirmed both v1 blockers fixed, and found one
+MAJOR + two minors, all folded in here: (MAJOR) a finger held past the lift grace now
+synthesizes a fresh cursor track-down (was going dead); (minor) the idle coast is mode-gated
+(no stray wheels if the host switches to PTP mid-coast); (minor) a coast is abandoned in the
+dead-bus branch (no stall-then-resume).
+
+**v2 was** — **reworked after an adversarial review found the v1 design non-functional.**
 Two v1 blockers, both confirmed against the real module:
 1. The task (`navigator_trackpad_ptp_task`) does **not** call `process_fallback_mouse` on
    no-contact frames — once the pad is idle it short-circuits (`if (host_contacts.count == 0)
@@ -141,6 +147,8 @@ static void scroll_coast_tick(void) {
           if (fabsf(scroll_state.vel_v) >= TRACKPAD_SCROLL_MOMENTUM_MIN ||
               fabsf(scroll_state.vel_h) >= TRACKPAD_SCROLL_MOMENTUM_MIN) {
               scroll_state.coasting = true;    // the task idle loop drives it from here
+          } else {
+              scroll_state.vel_v = scroll_state.vel_h = 0.0f;  // too slow: no coast
           }
           scroll_state.lift_armed = false;
           scroll_state.v_accum = scroll_state.h_accum = 0.0f;  // fresh accumulator for the coast
@@ -149,8 +157,22 @@ static void scroll_coast_tick(void) {
       if (timer_elapsed32(scroll_state.last_scroll_time) < TRACKPAD_SCROLL_LIFT_GRACE_MS) {
           return;                              // residual finger during the lift → suppress cursor
       }
-      scroll_state.lift_armed = false;         // grace expired with a finger down → intentional point
+      // Grace expired with a finger still down → intentional pointing. The rising-edge
+      // tracker won't re-arm (the finger has been down the whole time and the scroll-exit
+      // cleared tracking), so synthesize a fresh track-down on the slot-0 residual.
+      scroll_state.lift_armed = false;
       scroll_state.vel_v = scroll_state.vel_h = 0.0f;
+      if (finger_down) {                       // Phase-1 cursor follows slot 0
+          mouse_state.tracking         = true;
+          mouse_state.last_x           = sensor_report->fingers[0].x;
+          mouse_state.last_y           = sensor_report->fingers[0].y;
+          mouse_state.dx_accum         = 0.0f;
+          mouse_state.dy_accum         = 0.0f;
+          mouse_state.touch_start_time = timer_read32();
+          mouse_state.settled          = false;
+          mouse_state.is_drag          = false;
+      }
+      // fall through to the single-finger cursor logic
   }
   ```
   Note: `finger_count == 0` only reaches `process_fallback_mouse` on the lift-off-confirm
@@ -160,19 +182,37 @@ static void scroll_coast_tick(void) {
 ### Task idle branch — drive the coast (`navigator_trackpad_ptp_task`, ~line 411)
 
 ```c
+// Dead-bus branch (~line 405): abandon any coast so it can't stall then resume undecayed.
+if (!trackpad_init) {
+    no_data_frames = 0;
+#if TRACKPAD_SCROLL_MOMENTUM
+    scroll_state.coasting = false;
+    scroll_state.vel_v = scroll_state.vel_h = 0.0f;
+#endif
+    return false;
+}
+
+// Idle branch (~line 411): drive the coast each poll while no finger is present.
 if (host_contacts.count == 0) {
     no_data_frames = 0;
 #if TRACKPAD_SCROLL_MOMENTUM
     if (scroll_state.coasting) {
-        scroll_coast_tick();
+        // Gate on mode: the mode-change detection (and reset_mouse_state) only runs on a
+        // successful read, which never happens during an idle coast — so check here, else
+        // a host PTP-switch mid-coast would emit stray wheels for the whole decay.
+        if (digitizer_touchpad_get_input_mode() == TRACKPAD_INPUT_MODE_MOUSE) {
+            scroll_coast_tick();
+        } else {
+            scroll_state.coasting = false;   // host switched to PTP mid-coast
+        }
         return false;
     }
 #endif
     return false;
 }
 ```
-(`scroll_state.coasting` is only ever set in mode 0; a mode change calls `reset_mouse_state`
-which clears it. `scroll_state` is a file-static, visible to the task.)
+(`scroll_state` is a file-static, visible to the task. `coasting` is only set in mode 0; the
+mode gate + dead-bus clear above keep it from running in the wrong mode or stalling.)
 
 ### `reset_mouse_state()` — clear all momentum state
 
@@ -208,9 +248,15 @@ Add `coasting = false; lift_armed = false; vel_v = vel_h = 0.0f;` to the existin
   and you're scrolling, not clicking. Not gating the coast on the layer.
 - **Lift-grace vs. fast scroll→drag (minor):** a single-finger move within `_LIFT_GRACE_MS`
   (90 ms) after a scroll is suppressed; a real point resumes after the grace. Tunable.
-- **Mode-flip mid-coast (rare):** if the host switches to PTP (Navigator.app launched) during
-  a sub-second coast, a few stray wheel events may emit before the next read triggers
-  `reset_mouse_state`. Negligible.
+- **Mode-flip mid-coast (handled):** the idle coast is gated on
+  `digitizer_touchpad_get_input_mode() == MOUSE`, so a host PTP-switch mid-coast clears the
+  coast immediately rather than emitting stray wheels for the whole decay.
+- **Dead-bus mid-coast (handled):** the `!trackpad_init` branch clears the coast, so a real
+  I2C failure during a coast stops it cleanly instead of stalling then resuming undecayed.
+- **Residual-finger pointing after scroll:** held past `_LIFT_GRACE_MS`, a slot-0 residual
+  is re-acquired as a cursor (synthesized track-down). A slot-1-only residual (the lifted
+  finger was slot 0) still can't be tracked — a pre-existing Phase-1 single-finger-tracks-slot-0
+  limitation, not introduced here.
 - **Stair-step at the coast tail:** integer HID wheel; macOS smooths it. Accepted (Phase-1 same).
 
 ## Out of scope
