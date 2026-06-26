@@ -11,11 +11,12 @@
 // Mode-0 (no-app) cursor speed — only active when Navigator.app is not driving the pad.
 // #undef silences the benign -Wmacro-redefined (module config.h sets a default first).
 #undef  TRACKPAD_MOUSE_SENSITIVITY
-#define TRACKPAD_MOUSE_SENSITIVITY 0.6f    // starting point; dial in on-device (~0.5–0.8)
+#define TRACKPAD_MOUSE_SENSITIVITY 0.51f   // cursor speed (−15% from 0.6)
 #undef  TRACKPAD_MOUSE_ACCELERATION
 #define TRACKPAD_MOUSE_ACCELERATION 1.3f
 
-#define TRACKPAD_SCROLL_SENSITIVITY 0.04f  // two-finger scroll speed (patch default 0.10); lower = slower
+#define TRACKPAD_SCROLL_SENSITIVITY 0.02f  // two-finger scroll speed (−50% from 0.04; patch default 0.10)
+#define TRACKPAD_SCROLL_DECAY 0.96f        // momentum coast length (patch default 0.95; ~+30% coast)
 
 #define RGB_MATRIX_STARTUP_SPD 60
 
