@@ -1,8 +1,22 @@
 # Trackpad Scroll Smoothing (B2) — Design
 
 **Date:** 2026-06-25
-**Status:** Approved for planning
+**Status:** REJECTED — adversarial review found the core mechanism is a no-op at the operating point.
 **Depends on:** the existing two-finger scroll + momentum patch (`patches/navigator-trackpad-twofinger-scroll.patch`)
+
+> **Rejection note (2026-06-25):** Adversarial review showed this design cannot work at
+> `TRACKPAD_SCROLL_SENSITIVITY 0.016`. The chunkiness is caused by event **sparseness** (one
+> 1-line wheel event every few hundred ms at slow speed), not by step-size or timing
+> **variance**. At this sensitivity every emit is already exactly one wheel line, so there is
+> no variance for the velocity EMA to smooth, and the accumulator's ~62-frame integration
+> window is already a far stronger low-pass than a 2-frame EMA — so switching active emission
+> from raw delta to smoothed velocity shifts crossing times by single-digit ms out of ~300ms
+> gaps (imperceptible). Crucially, total wheel lines = speed × time is conserved: **no
+> value-stream reshaping can add events**, and only added events (density) close the
+> perceptual gap. The supporting observation ("coast feels smoother, coast uses the EMA") was
+> misattributed — the coast is smoother because it runs faster (denser events), not because of
+> the EMA. At integer wheel resolution, smooth and slow are mutually exclusive in firmware.
+> Preserved for the reasoning; do not implement.
 
 ## Problem
 
