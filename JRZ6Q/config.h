@@ -15,8 +15,8 @@
 #undef  TRACKPAD_MOUSE_ACCELERATION
 #define TRACKPAD_MOUSE_ACCELERATION 1.3f
 
-#define TRACKPAD_SCROLL_SENSITIVITY 0.02f  // two-finger scroll speed (−50% from 0.04; patch default 0.10)
-#define TRACKPAD_SCROLL_DECAY 0.96f        // momentum coast length (patch default 0.95; ~+30% coast)
+#define TRACKPAD_SCROLL_SENSITIVITY 0.016f // two-finger scroll speed (−20% from 0.02; patch default 0.10)
+#define TRACKPAD_SCROLL_DECAY 0.905f       // momentum coast length (~−60% coast vs 0.96; patch default 0.95)
 
 #define RGB_MATRIX_STARTUP_SPD 60
 
