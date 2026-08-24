@@ -1,9 +1,9 @@
 diff --git a/automouse/automouse.c b/automouse/automouse.c
-index e8c9277..bfe6f3f 100644
+index 9801d99..326dc98 100644
 --- a/automouse/automouse.c
 +++ b/automouse/automouse.c
 @@ -25,6 +25,12 @@ static struct {
-     .is_enabled = true,
+     .enabled = {[AUTOMOUSE_DEVICE_TRACKBALL] = AUTOMOUSE_ENABLED_TRACKBALL, [AUTOMOUSE_DEVICE_TRACKPAD] = AUTOMOUSE_ENABLED_TRACKPAD},
  };
  
 +#ifndef AUTOMOUSE_CONTACT_STALE_MS
@@ -12,32 +12,36 @@ index e8c9277..bfe6f3f 100644
 +static bool     finger_present = false;
 +static uint16_t last_contact   = 0;
 +
- static bool layer_held_externally(void) {
- #ifdef LAYER_LOCK_ENABLE
-     if (is_layer_locked(AUTOMOUSE_LAYER)) return true;
-@@ -132,8 +138,13 @@ report_mouse_t pointing_device_task_automouse(report_mouse_t mouse_report) {
+ static bool automouse_default_enabled_for(automouse_device_t dev) {
+     return dev == AUTOMOUSE_DEVICE_TRACKPAD ? AUTOMOUSE_ENABLED_TRACKPAD : AUTOMOUSE_ENABLED_TRACKBALL;
+ }
+@@ -232,8 +238,15 @@ report_mouse_t pointing_device_task_automouse(report_mouse_t mouse_report) {
          return mouse_report;
      }
  
 -    // Keep layer alive while keys are held on it
 -    if (state.is_active && state.held_keys > 0) {
 +    // Keep the layer alive while keys are held on it, or while a finger rests in contact.
-+    // The contact term is gated on the layer ACTUALLY being on (layer_state_is), so a
-+    // layer the keymap typed-off is never kept warm — its normal 650ms timeout/reset runs.
++    // The contact term is scoped to a trackpad-owned session and gated on that session's
++    // layer ACTUALLY being on (layer_state_is), so a layer the keymap typed-off is never
++    // kept warm — its normal timeout/reset runs.
 +    if (state.is_active &&
 +        (state.held_keys > 0 ||
-+         (layer_state_is(AUTOMOUSE_LAYER) && finger_present &&
++         (state.active_device == AUTOMOUSE_DEVICE_TRACKPAD &&
++          layer_state_is(state.active_layer) && finger_present &&
 +          timer_elapsed(last_contact) < AUTOMOUSE_CONTACT_STALE_MS))) {
          state.last_activity = timer_read();
      }
  
-@@ -207,3 +218,13 @@ bool process_record_automouse(uint16_t keycode, keyrecord_t *record) {
- 
-     return true;
+@@ -276,6 +289,19 @@ void automouse_report_motion(int16_t dx, int16_t dy, uint8_t buttons) {
+     automouse_accumulate(AUTOMOUSE_DEVICE_TRACKPAD, dx, dy, 0, 0, buttons);
  }
-+
+ 
++// Feed finger-contact presence from the same digitizer that calls
++// automouse_report_motion(), so a motionless-but-present finger keeps the trackpad's
++// mouse layer warm while that layer owns the active session.
 +void automouse_report_contact(bool present) {
-+    if (!state.is_enabled) {
++    if (!state.enabled[AUTOMOUSE_DEVICE_TRACKPAD]) {
 +        return;
 +    }
 +    finger_present = present;
@@ -45,11 +49,15 @@ index e8c9277..bfe6f3f 100644
 +        last_contact = timer_read();
 +    }
 +}
++
+ bool process_record_automouse(uint16_t keycode, keyrecord_t *record) {
+     if (keycode == KC_AUTOMOUSE_TOGGLE) {
+         if (record->event.pressed) {
 diff --git a/automouse/automouse.h b/automouse/automouse.h
-index e9513d2..0ec46d9 100644
+index 1d7acaf..a2adfba 100644
 --- a/automouse/automouse.h
 +++ b/automouse/automouse.h
-@@ -45,3 +45,8 @@ bool automouse_is_active(void);
+@@ -125,3 +125,8 @@ void automouse_toggle_device(automouse_device_t dev);
  // Feed motion from a sensor that bypasses the QMK pointing-device pipeline
  // (e.g. a digitizer/trackpad) so it can activate the mouse layer.
  void automouse_report_motion(int16_t dx, int16_t dy, uint8_t buttons);
